@@ -44,6 +44,42 @@ participate in matching.
 `targets-v2.json` remains unchanged for released 0.2.3 clients. New clients
 read only schema version 3.
 
+## The generic tier
+
+`kernelsu-generic.json` is a second, separate feed, and it is read only when a device has no entry of
+its own to be served by. It holds one daemon per flavour, each carrying a kernel module for several
+KMIs instead of one:
+
+```json
+{
+  "schemaVersion": 1,
+  "generic": [
+    {
+      "flavor": "kernelsu",
+      "kmis": ["android12-5.10", "android14-6.1", "android15-6.6"],
+      "daemon": { "url": "...", "size": 6407096, "sha256": "...", "version": "3.3.0" }
+    }
+  ]
+}
+```
+
+The `kmis` array is read out of the daemon's own asset table rather than typed in, and the entry is
+refused if it disagrees with the binary - a daemon that claims a KMI it has no module for is one that
+would fail on the phone with nothing in the feed to say so.
+
+Why it is a separate file and not a field in `targets-v3.json`: an entry there names the artifact its
+device was tested with, and that file is rewritten in place by span edits for every pair a release
+moves. A generic daemon is a fallback for devices that have no such entry, so it lives where a
+mistake can only offer a fallback that does not load, and cannot move a device that works onto a
+different daemon. Nothing in this file is served by any entry in `targets-v3.json`, and no job writes
+both.
+
+The tier exists because the KernelSU half of a payload is the one half that is not device-specific:
+`ksud` picks its module out of its own asset directory by KMI at run time, so a daemon carrying one
+module per KMI serves a whole KMI family. It replaces the older arrangement where a single artifact
+was shared by several device entries - the `s25u` bundle and its siblings - because those were built
+outside the pair job and could not be rebuilt when a KernelSU release moved.
+
 ## How entries are published
 
 A KernelSU release makes every pair in this file stale, and `upstream-watch.yml` is what closes
@@ -67,7 +103,10 @@ What that leaves for a person, and why:
 touches cannot be merged by a runner. The workflow tries, and files an issue with the conflicting
 hunks when it cannot.
 - **Entries served by a hand-built pair.** The `s25u` bundle and its siblings are one module
-shared by several models, built outside the pair job. `tools/pairs.py` reports them instead of
-guessing, and the run summary lists them.
+  shared by several models, built outside the pair job. `tools/pairs.py` reports them instead of
+  guessing, and the run summary lists them. A rebuilt daemon of that shape belongs in
+  `kernelsu-generic.json` rather than shared between entries - see
+  [the generic tier](#the-generic-tier) - because a daemon the workflow builds is one a release can
+  move.
 - **A device port with no document.** The release a pair must claim is device truth; where it has
 never been written down there is nothing to build against.

@@ -52,6 +52,11 @@ on:
         required: false
         type: string
         default: '["android15-6.6","android14-6.1"]'
+      generic_kmis:
+        description: 'KMIs the KMI-generic daemon carries, as a JSON array. Empty builds no generic daemon; setting it also decides which KMIs the module job builds'
+        required: false
+        type: string
+        default: ''
       target_id:
         description: 'Target id for the publishable pair, e.g. pa3q-S938USQSCCZF9'
         required: false
@@ -95,6 +100,13 @@ on:
         description: 'KMIs for the kernel module, as a JSON array'
         required: true
         default: '["android15-6.6","android14-6.1"]'
+      # Filling this in builds the other thing a daemon can be: one per flavour carrying a module for
+      # every KMI here, instead of one per target carrying only its own. It also decides what the
+      # module job builds, so the two cannot disagree. The pair inputs below are unaffected by it.
+      generic_kmis:
+        description: 'KMIs the KMI-generic daemon carries, as a JSON array. Empty skips the generic daemon.'
+        required: false
+        default: ''
       # The two inputs below turn this from a compile check into a pair that can be served by the
       # feed: the module has to name the target's own kernel release, and `ksud` has to embed it.
       # Leave the release empty to skip those jobs.
@@ -148,6 +160,11 @@ env:
   # `<kmi>_kernelsu.ko` - all three flavours come from KernelSU's lineage - so this is a published
   # name only.
   FLAVOR_SUFFIX: ${{ fromJSON('{"kernelsu":"","kernelsu-next":"-next","resukisu":"-rsksu"}')[inputs.flavor || 'kernelsu'] }}
+  # The KMIs this run builds a module for, in one place. A generic run has to build exactly the set
+  # its daemon will carry, so the same list decides both - a daemon asked for a KMI the run never
+  # built dies on a missing artifact download, which reads as a broken build rather than as the
+  # mismatch it is. `generic_kmis` first, then the compile check's own list.
+  KMI_SET: ${{ inputs.generic_kmis || inputs.kmi || '["android15-6.6","android14-6.1"]' }}
   KSU_REF: ${{ inputs.ksu_ref || 'v3.3.0' }}
   PATCH: kernelsu/patches/${{ fromJSON('{"kernelsu":"KernelSU","kernelsu-next":"KernelSU-Next","resukisu":"ReSukiSU"}')[inputs.flavor || 'kernelsu'] }}-${{ inputs.ksu_ref || 'v3.3.0' }}-samsung-kdp-rkp-defex.patch
   # How `ksud` has to be asked for. KernelSU is one Cargo workspace at its root, so its package is
@@ -334,8 +351,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kmi: ${{ fromJSON(inputs.kmi || '["android15-6.6","android14-6.1"]') }}
-        no_patch_text: [false, true]
+        # Read straight from the inputs rather than through `env.KMI_SET`: a job matrix is evaluated
+        # before the environment exists, so `env` is not an available context here. The generic job
+        # below reads the same list through `env.KMI_SET`, which is the same value by construction.
+        kmi: ${{ fromJSON(inputs.generic_kmis || inputs.kmi || '["android15-6.6","android14-6.1"]') }}
+        # A generic daemon carries the no-patch-text variant - the one that has survived a device
+        # whose live text patching panics, see docs/SM-S921B-S921BXXSFDZE1.md - so a generic run
+        # builds only that, instead of pulling a DDK image twice per KMI for the variant it will
+        # not embed.
+        no_patch_text: ${{ fromJSON(inputs.generic_kmis != '' && '[true]' || '[false, true]') }}
     container:
       image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-${{ inputs.ddk_release || '20260828' }}
       options: --privileged
@@ -880,5 +904,249 @@ jobs:
           git add $files
           git commit -q -m "build(payloads): publish the ${{ env.FLAVOR }} pair for ${{ inputs.target_id }}" \
             -m "Built from ${{ env.KSU_REF }} by the ${{ github.workflow }} workflow."
+          git pull --rebase --autostash
+          git push
+
+  # ---------------------------------------------------------------------------------------------
+  # The KMI-generic daemon: one per flavour, carrying a module for every KMI the run built.
+  #
+  # A pair's daemon embeds exactly the module built for its own target, so it is served to that one
+  # device. That is the right default, and it is also why a device with no target entry has nothing
+  # to load. The KernelSU half is the one part of a payload that does not have to be device-specific:
+  # `ksud` picks its kernel module out of its own asset directory by KMI at run time
+  # (`format!("{kmi}_kernelsu.ko")`), so a daemon carrying one module per KMI serves every device
+  # whose KMI is in that set. The three hand-built `ksud-samsung-*` bundles already work this way -
+  # `ksud-samsung-android12-5.10-kdp` carries three KMIs - and making that reproducible is the point:
+  # `support/README.md` lists them as the one thing a KernelSU bump cannot rebuild.
+  #
+  # The modules are the `module` job's own, deliberately. That build leaves the DDK's UTS_RELEASE in
+  # `vermagic`, and `ksuinit::load_module()` replaces it with the value the running kernel requires
+  # before retrying `init_module` - "Kernel requires vermagic X; replacing and retrying". Substituting
+  # a device's release at build time is what makes a *pair* loadable on exactly one device; leaving it
+  # alone and letting the loader rewrite it is what makes one module cover a KMI family.
+  #
+  # Nothing already published moves. A pair daemon and a generic daemon are different files, served
+  # from different feed files, and the pair jobs above neither read nor write anything here.
+  # ---------------------------------------------------------------------------------------------
+  generic-ksud:
+    name: generic ksud (${{ inputs.flavor || 'kernelsu' }}, ${{ inputs.generic_kmis }})
+    needs: module
+    if: inputs.generic_kmis != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout payloads
+        uses: actions/checkout@v7
+
+      - name: Check the patch exists for this ref
+        run: |
+          if [ ! -f "${{ env.PATCH }}" ]; then
+            echo "::error::No patch for ref ${{ env.KSU_REF }}: expected ${{ env.PATCH }}"
+            ls -1 kernelsu/patches/ || true
+            exit 1
+          fi
+
+      - name: Checkout KernelSU
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.FLAVOR_REPO }}
+          ref: ${{ env.KSU_REF }}
+          path: KernelSU
+          # See the compile-check job: `build.rs` derives `VERSION_NAME` from `git describe`, and a
+          # tagless checkout stamps a daemon the app reads as "no KernelSU".
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Point the suspended Kernel-SU dependencies at KernelSU2
+        run: |
+          cd KernelSU
+          mapfile -t manifests < <(find . -name Cargo.toml -o -name Cargo.lock | grep -v '/target/')
+          echo "manifests: ${#manifests[@]}"
+          sed -i 's#github\.com/Kernel-SU/#github.com/KernelSU2/#g' "${manifests[@]}"
+
+      - name: Apply the Samsung patch
+        run: git -C KernelSU apply --verbose "$GITHUB_WORKSPACE/${{ env.PATCH }}"
+
+      - name: Neither shortcut may drop what the full path does
+        run: python3 tools/check_rkp_branch.py --tree KernelSU
+
+      - name: Collect the module built for each KMI
+        uses: actions/download-artifact@v7
+        with:
+          # One artifact per KMI, named by the `module` job. Merged into per-KMI directories rather
+          # than flattened, because every one of them is called `kernelsu.ko` and a flattened
+          # download would keep one and silently drop the rest.
+          pattern: kernelsu-${{ env.KSU_REF }}-*-no-patch-text
+          path: /tmp/generic
+
+      - name: Stage them where the daemon looks for them
+        run: |
+          # `ksud`'s build script embeds whatever `userspace/ksud/bin/aarch64/` holds, and the loader
+          # asks it for `<kmi>_kernelsu.ko` - so these file names are an interface, not a convention.
+          # A KMI missing here is a daemon that would refuse to root that device at run time, with
+          # nothing in the build to say so, which is why it is an error rather than a warning.
+          set -eu
+          kmis=$(python3 -c 'import json,sys; print(" ".join(json.loads(sys.argv[1])))' '${{ env.KMI_SET }}')
+          echo "the daemon will carry: $kmis"
+          mkdir -p KernelSU/userspace/ksud/bin/aarch64
+          for kmi in $kmis; do
+            src="/tmp/generic/kernelsu-${{ env.KSU_REF }}-${kmi}-no-patch-text/kernelsu.ko"
+            if [ ! -s "$src" ]; then
+              echo "::error::the module job built no no-patch-text module for $kmi"
+              ls -1 /tmp/generic || true
+              exit 1
+            fi
+            cp "$src" "KernelSU/userspace/ksud/bin/aarch64/${kmi}_kernelsu.ko"
+          done
+          ls -l KernelSU/userspace/ksud/bin/aarch64/
+
+      - name: Rust toolchain and target
+        run: |
+          rustup toolchain install "${{ env.FLAVOR_TOOLCHAIN }}" --profile minimal \
+            --target aarch64-linux-android
+
+      - name: Android NDK
+        run: |
+          curl -sSLo /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r28c-linux.zip
+          unzip -q /tmp/ndk.zip -d /tmp
+          echo "ANDROID_NDK_HOME=/tmp/android-ndk-r28c" >> "$GITHUB_ENV"
+
+      - name: libclang for bindgen
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libclang-dev
+          clanglib=$(llvm-config --libdir 2>/dev/null || true)
+          if [ -z "$clanglib" ] || [ ! -e "$clanglib/libclang.so" ]; then
+            clanglib=$(dirname "$(find /usr/lib/llvm-* -name 'libclang.so*' -printf '%p\n' 2>/dev/null | head -1)")
+          fi
+          echo "LIBCLANG_PATH=$clanglib" >> "$GITHUB_ENV"
+
+      - name: Cargo config for the NDK
+        run: |
+          if [ -f KernelSU/scripts/setup_cargo_config.py ]; then
+            python3 KernelSU/scripts/setup_cargo_config.py --ndk-root "$ANDROID_NDK_HOME" --force
+          else
+            # See the compile-check job: KernelSU-Next carries neither that script nor a `.cargo/`
+            # template, so the config it would have generated is written here instead.
+            ndk="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+            mkdir -p KernelSU/.cargo
+            cat > KernelSU/.cargo/config.toml <<EOF
+          [target.aarch64-linux-android]
+          linker = "$ndk/bin/aarch64-linux-android26-clang"
+
+          [env]
+          CC_aarch64_linux_android = "$ndk/bin/aarch64-linux-android26-clang"
+          CXX_aarch64_linux_android = "$ndk/bin/aarch64-linux-android26-clang++"
+          AR_aarch64_linux_android = "$ndk/bin/llvm-ar"
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = "--sysroot=$ndk/sysroot -I$ndk/sysroot/usr/include/aarch64-linux-android"
+          EOF
+          fi
+
+      - name: Build the daemon around them
+        run: |
+          tag=$(git -C KernelSU describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -z "$tag" ]; then
+            echo "::error::no tag in this checkout; the published ksud would report 0.0.0"
+            exit 1
+          fi
+          echo "the daemon will be stamped $tag"
+          export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          cd KernelSU
+          cargo +"${{ env.FLAVOR_TOOLCHAIN }}" build --release --locked \
+            --target aarch64-linux-android $CARGO_ARGS
+          find . -type f -name ksud -path '*/aarch64-linux-android/release/*' -exec file {} \;
+
+      - name: The asset table has to be the set this run built
+        run: |
+          # The only evidence that a daemon carries a module rather than having been built beside it:
+          # `ksud` answers for its own assets, and the loader indexes that table by KMI. Neither the
+          # file size nor the daemon's name can say it - the hand-built 5.10 bundle is named for one
+          # KMI and carries three - which is what tools/generic_daemon.py reads instead.
+          binary=$(find KernelSU -type f -name ksud -path '*/aarch64-linux-android/release/*' | head -1)
+          python3 tools/generic_daemon.py --check \
+            --daemon "ksud${{ env.FLAVOR_SUFFIX }}-generic-kdp" --artifact "$binary" \
+            --expect '${{ env.KMI_SET }}'
+
+      - name: Name it the way the feed will serve it
+        env:
+          SUFFIX: ${{ env.FLAVOR_SUFFIX }}
+        run: |
+          # Named for what it is rather than for a KMI: the set it carries is declared by the feed
+          # entry, and a name like the hand-built `-android12-5.10-` ones would say `5.10` about a
+          # binary that also carries 6.1 and 6.6.
+          out="ksud${SUFFIX}-generic-kdp"
+          cp "$(find KernelSU -type f -name ksud -path '*/aarch64-linux-android/release/*' | head -1)" "$out"
+          ls -l "$out"
+          echo "size: $(stat -c %s "$out")"
+          echo "sha256: $(sha256sum "$out" | cut -d' ' -f1)"
+
+      - name: Upload the daemon
+        uses: actions/upload-artifact@v7
+        with:
+          name: generic-ksud-${{ env.FLAVOR }}
+          path: ksud${{ env.FLAVOR_SUFFIX }}-generic-kdp
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------------------
+  # Publishing the generic daemon into its own feed.
+  #
+  # Separate from `publish` on purpose, and separate file and all: a device's entry in
+  # `support/targets-v3.json` names the artifact that device was tested with, and a generic daemon
+  # must not be able to change it. The tier lives in `support/kernelsu-generic.json`, which no other
+  # job writes, so the worst a mistake here can do is offer a fallback that does not load - rather
+  # than move a device that is working onto a different daemon.
+  # ---------------------------------------------------------------------------------------------
+  publish-generic:
+    name: publish generic (${{ inputs.flavor || 'kernelsu' }})
+    needs: [module, generic-ksud]
+    if: inputs.generic_kmis != '' && inputs.publish
+    runs-on: ubuntu-latest
+    # The same group as `publish`, deliberately: two publishes race between pulling and pushing to one
+    # branch, and a generic daemon and a pair landing in the same commit is not a problem worth
+    # avoiding at the cost of two runs conflicting over the same feed. Nothing is lost by one waiting.
+    concurrency:
+      group: publish-feed
+      cancel-in-progress: false
+    steps:
+      - name: Checkout payloads
+        uses: actions/checkout@v7
+
+      - name: Collect the daemon
+        uses: actions/download-artifact@v7
+        with:
+          name: generic-ksud-${{ env.FLAVOR }}
+          path: kernelsu
+
+      - name: The artifact that arrived carries the set this run built
+        run: |
+          # Re-checked here rather than taken on trust from the build job, because this is the job
+          # that names it in a feed a device reads. The version is not re-derived: both jobs read
+          # `env.KSU_REF` from the same run inputs, so a second reading of it could only be the same
+          # fact stated twice.
+          daemon="ksud${{ env.FLAVOR_SUFFIX }}-generic-kdp"
+          test -s "kernelsu/$daemon" || { echo "::error::no daemon at kernelsu/$daemon"; exit 1; }
+          python3 tools/generic_daemon.py --check \
+            --daemon "$daemon" --artifact "kernelsu/$daemon" --expect '${{ env.KMI_SET }}'
+
+      - name: Point the generic feed at it
+        run: |
+          daemon="ksud${{ env.FLAVOR_SUFFIX }}-generic-kdp"
+          python3 tools/generic_daemon.py \
+            --repo . --daemon "$daemon" --artifact "kernelsu/$daemon" \
+            --flavor "${{ env.FLAVOR }}" --expect '${{ env.KMI_SET }}' \
+            --version "${{ env.KSU_REF }}" \
+            --url-prefix "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}"
+
+      - name: Commit
+        run: |
+          files="kernelsu support/kernelsu-generic.json"
+          if git diff --quiet -- $files; then
+            echo "Nothing changed; the generic feed already serves this daemon."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add $files
+          git commit -q -m "build(payloads): publish the generic ${{ env.FLAVOR }} daemon" \
+            -m "Carries $(python3 -c 'import json,sys; print(", ".join(json.loads(sys.argv[1])))' '${{ env.KMI_SET }}'), built from ${{ env.KSU_REF }} by the ${{ github.workflow }} workflow."
           git pull --rebase --autostash
           git push

@@ -44,9 +44,9 @@ reads a version takes the flavour as an input.
 | `android14-6.1_kernelsu-e1s-S921BXXSFDZE1-kdp.ko` | `SM-S921B`, `S921BXXSFDZE1` | `android14-6.1` | Exact E1S no-patch-text module with target `vermagic`, audited for manual relocation |
 | `ksud-e1s-S921BXXSFDZE1-kdp` | Same exact E1S build | `android14-6.1` | Device-tested late-load binary embedding the E1S no-patch-text module |
 | `android14-6.1_kernelsu-samsung-kdp.ko` | `SM-S721N` `S721NKSSCDZF3`; `SM-S921B` `S921BXXSFDZF2` | `android14-6.1` | Standalone Samsung KDP/RKP/DEFEX module with target `vermagic` |
-| `ksud-samsung-android14-6.1-kdp` | Same verified 6.1 targets | `android14-6.1` | Late-load binary embedding the 6.1 module |
+| `ksud-samsung-android14-6.1-kdp` | Same verified 6.1 targets | `android14-6.1`, `android15-6.6` | Late-load binary carrying **two** KMIs (`android14-6.1_kernelsu.ko` and `android15-6.6_kernelsu.ko`), the same shape as the 5.10 one below |
 | `android12-5.10_kernelsu-samsung-kdp.ko` | `SM-A155N` `A155NKSS6BYH1` | `android12-5.10` | Standalone Samsung KDP/RKP/DEFEX module built against the exact A15 kernel |
-| `ksud-samsung-android12-5.10-kdp` | `SM-A155N` `A155NKSS6BYH1` | `android12-5.10` | Late-load binary embedding the 5.10 module |
+| `ksud-samsung-android12-5.10-kdp` | `SM-A155N` `A155NKSS6BYH1` | `android12-5.10`, `android14-6.1`, `android15-6.6` | Late-load binary carrying a module for **three** KMIs, not one: its asset table offers `android12-5.10_kernelsu.ko`, `android14-6.1_kernelsu.ko` and `android15-6.6_kernelsu.ko`, and `ksud` picks by the running phone's KMI. This row said "the 5.10 module" until `tools/generic_daemon.py` read the table back out of the binary; that tool's self-test now holds it to this list |
 | `android12-5.10_kernelsu-F9360ZCSAIZF1-c12-nolto.ko` | `SM-F9360` `F9360ZCSAIZF1` | `android12-5.10` | Exact Z Fold4 module for auditing; no-LTO clang-12 (stock THIN-LTO function-sections layout panics on load for this kernel), 201-symbol manual relocation, loaded via `init_module` outside `ksud`; device-tested 2026-08-12 and 2026-09-01. A matching `ksud-F9360ZCSAIZF1-kdp` embedding this module is pending |
 | `android13-5.15.189_kernelsu-dm2q-S916BXXSAFZG1.ko` | `SM-S916B`, `S916BXXSAFZG1` | `android13-5.15` | Exact-source FZG1 module; RKP syscall-table and live text patching disabled; hardware load untested |
 | `ksud-dm2q-S916BXXSAFZG1-kdp` | Same exact S916B build | `android13-5.15` | Kallsyms-aware late-load binary embedding the exact-source FZG1 module; hardware load untested |
@@ -414,3 +414,49 @@ Copy the stripped KO to
 `userspace/ksud/bin/aarch64/android12-5.10_kernelsu.ko`, force `ksud` to
 recompile after the asset changes, and publish the KO and late-load binary as
 one versioned pair.
+
+## A daemon that carries more than one KMI
+
+`ksud` loads its kernel module from its **own asset directory**, asking for
+`<kmi>_kernelsu.ko` after reading the running kernel's version. Nothing about
+that is device-specific: a daemon with a module staged for each KMI serves every
+phone whose KMI is in that set, which is what the `ksud-samsung-*` bundles above
+have always done by hand.
+
+`ksu-build.yml` builds that shape as `ksud<suffix>-generic-kdp` - one per
+flavour - and `tools/generic_daemon.py` publishes it to
+`support/kernelsu-generic.json`, which is a **separate feed** from the one the
+app's per-device entries live in. Dispatch the workflow with `generic_kmis` set
+to the KMI array, e.g.
+
+```text
+generic_kmis = ["android12-5.10","android13-5.15","android14-6.1","android15-6.6"]
+publish      = true
+```
+
+The same list decides two things that have to agree: which KMIs the `module` job
+builds, and which ones the daemon embeds. The daemon job stages each built module
+as `<kmi>_kernelsu.ko`, builds once, and then reads the asset table back out of
+the binary - neither the file size nor the name can say what a daemon carries,
+which is why those three hand-built bundles above were for years described as
+carrying one module each.
+
+Two deliberate choices in that path:
+
+- **The modules are the `module` job's, so they keep the DDK's own `UTS_RELEASE`
+in `vermagic`.** A *pair* substitutes the target's exact release so the loader
+accepts it as-is; a generic daemon does not, because
+`ksuinit::load_module()` rewrites `vermagic` to the kernel-required value and
+retries (`Kernel requires vermagic X; replacing and retrying`). That rewrite is
+what lets one module cover a KMI family.
+- **The no-patch-text variant is the one embedded.** It is the variant that
+survived hardware where live text patching panicked
+([`../docs/SM-S921B-S921BXXSFDZE1.md`](../docs/SM-S921B-S921BXXSFDZE1.md)), and
+it is the default for a daemon whose module cannot be chosen for the device it
+lands on.
+
+A generic daemon does **not** replace a pair. A pair's module claims the exact
+kernel release its device runs and its entry in `support/targets-v3.json` names
+the artifact that device was tested with; the generic tier is for devices with no
+entry of their own, and the two feeds are written by different jobs so neither
+can move the other.
