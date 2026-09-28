@@ -1,4 +1,20 @@
 {
   "schemaVersion": 1,
-  "generic": []
+  "generic": [
+    {
+      "flavor": "kernelsu",
+      "kmis": [
+        "android12-5.10",
+        "android13-5.15",
+        "android14-6.1",
+        "android15-6.6"
+      ],
+      "daemon": {
+        "url": "https://raw.githubusercontent.com/rushiranpise/Root-My-Galaxy-Payloads/main/kernelsu/ksud-generic-kdp",
+        "size": 5475352,
+        "sha256": "f4121ed34eeb4656802f24a4d3d0f7b9eb07304f89c57ce16112027d590a2885",
+        "version": "3.3.0"
+      }
+    }
+  ]
 }
