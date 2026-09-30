@@ -1001,6 +1001,28 @@
         "sha256": "8c59f4e9d09a00ae0f763e41c08d35a85cd99570d3565a1fe6cc99afa12625c5",
         "version": "4.2.0-rc3"
       }
+    },
+    {
+      "payloadId": "s931u-S931USQSCCZF9-rsksu420",
+      "displayName": "Galaxy S25 SM-S931U | Kernel 6.6.98 | ReSukiSu 4.2.0-rc3",
+      "models": [
+        "SM-S931U",
+        "SM-S931U1"
+      ],
+      "kernelVersions": [
+        "6.6.98"
+      ],
+      "flavor": "resukisu",
+      "exploit": {
+        "url": "https://raw.githubusercontent.com/VenusIsJaded/Root-My-Galaxy-Payloads/main/artifacts/pa3q-S938NKSUACZF1/cve-2026-43499-app.so",
+        "size": 104128
+      },
+      "kernelsu": {
+        "url": "https://raw.githubusercontent.com/VenusIsJaded/Root-My-Galaxy-Payloads/main/kernelsu/ksud-rsksu-generic-kdp",
+        "size": 4798280,
+        "sha256": "a1445e9217d5629831d626e85ded4100af3296149ce0cdc3e400611b299fbe44",
+        "version": "4.2.0-rc3"
+      }
     }
   ]
 }
