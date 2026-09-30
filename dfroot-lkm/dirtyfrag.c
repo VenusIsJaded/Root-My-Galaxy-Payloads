@@ -21,8 +21,27 @@
 //      read-only partition wall, and Auto soft restart) - so passing them would make
 //      the daemon fail to parse its own command line.
 //
+// And one thing this chain has to do that upstream's does not: **stage the daemon**.
+//
+// The daemon built for this project runs `late-load` in two halves. Its first act is to
+// rename `/data/local/tmp/.ksud-stage` onto `/data/adb/ksud`, because the install has to
+// happen before loading the module changes this process's security context; that file is
+// the daemon's own bytes, put there by whoever wants it installed. The payload flow
+// stages it as part of every run, and an install **consumes** it - so a universal run,
+// which is the other flow entirely, found nothing to rename and exited non-zero before
+// it did anything at all. That is what `/dev/dfm1` was saying.
+//
+// So this command writes it as well, from the daemon the app staged: this runs as root,
+// with the app's data directory readable, which is the one place that can. The same
+// three facts the payload flow's staging pass keeps apply here - the file is the daemon
+// this run resolved, it is executable, and it is where that daemon's own `late-load`
+// looks for it.
+//
 // The markers are upstream's and unchanged: /dev/dfm0 for "late-load completed",
-// /dev/dfm1 for "it did not", which is what the chain's parent side reports on.
+// /dev/dfm1 for "it did not", which is what the chain's parent side reports on. The
+// daemon's own output goes to a file beside the stage file, because a usermode helper
+// has no stdout: without that redirect a refusal is a bare non-zero exit code, which is
+// what made the staging bug above take a whole diagnostic round to find.
 
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -42,6 +61,11 @@ MODULE_DESCRIPTION("DFRoot LKM");
 /* The manager the daemon is told to serve. The app passes the flavour's package. */
 static char package_name[64] = "me.weishu.kernelsu";
 module_param_string(package_name, package_name, sizeof(package_name), 0);
+
+/* The daemon this chain stages and runs, and where its own `late-load` looks for it. */
+#define DAEMON "/data/user_de/0/dev.rushiranpise.rmgnext/ksud"
+#define STAGE "/data/local/tmp/.ksud-stage"
+#define DAEMON_LOG "/data/local/tmp/dfroot-ksud.log"
 
 static unsigned long kprobes_lookup(const char *name) {
 	struct kprobe kp = { .symbol_name = name };
@@ -66,6 +90,8 @@ static int __nocfi __init dirtyfrag_init(void) {
 	umh_setup_t umh_setup;
 	umh_exec_t  umh_exec;
 	unsigned long selinux;
+	/* 512, not 256: the command carries two paths and the manager's package name. */
+	static char cmd[512];
 
 	kln = (kallsyms_lookup_name_t)kprobes_lookup("kallsyms_lookup_name");
 	if (!kln) return -EINVAL;
@@ -80,15 +106,24 @@ static int __nocfi __init dirtyfrag_init(void) {
 
 	if (umh_setup && umh_exec) {
 		static const char sh[]   = "/system/bin/sh";
-		static char cmd[256];
 		static char *envp[] = { "HOME=/", "PATH=/sbin:/vendor/bin:/system/bin", NULL };
 		static char *argv[] = { (char *)sh, "-c", cmd, NULL };
 		void *info;
 
+		/*
+		 * Stage, then load.
+		 *
+		 * `cp` rather than `mv`: the daemon the app staged is the only copy of those bytes, and a run
+		 * that failed before `late-load` renamed the stage file would otherwise have left the app with
+		 * nothing to stage again. The daemon renames it itself as its first act, which is what consumes
+		 * it.
+		 */
 		snprintf(cmd, sizeof(cmd),
-			 "%s late-load --package-name %s"
+			 "cp %s %s && chmod 0755 %s"
+			 " && %s late-load --package-name %s > %s 2>&1"
 			 " && touch /dev/dfm0 || touch /dev/dfm1",
-			 "/data/user_de/0/dev.rushiranpise.rmgnext/ksud", package_name);
+			 DAEMON, STAGE, STAGE,
+			 DAEMON, package_name, DAEMON_LOG);
 
 		info = umh_setup(sh, argv, envp, GFP_KERNEL, NULL, NULL, NULL);
 		if (info) {

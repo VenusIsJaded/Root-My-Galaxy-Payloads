@@ -91,6 +91,14 @@ jobs:
             echo "::error::the module names upstream's package again"
             exit 1
           fi
+          # The staging, which upstream has no reason to do and this chain cannot work without: the daemon
+          # built here renames that file onto /data/adb/ksud as its first act, and an install consumes it - so
+          # a universal run that does not write it finds nothing to rename and exits before doing anything.
+          # That is a bug this repository has already shipped once and paid a diagnostic round for.
+          grep -q "/data/local/tmp/.ksud-stage" /tmp/strings.txt || {
+            echo "::error::the module no longer stages the daemon, so late-load has nothing to rename onto /data/adb/ksud"
+            exit 1
+          }
           for flag in -- --ro-partitions --soft-reboot; do
             [ "$flag" = "--" ] && continue
             if grep -q -- "$flag" /tmp/strings.txt; then
