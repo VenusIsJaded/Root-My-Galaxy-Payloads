@@ -1,0 +1,114 @@
+# The kernel module the universal root's chain loads.
+#
+# One module per KMI, built inside the same DDK images the KernelSU modules in this repository are built
+# in. The app embeds these eight files in its APK, so they are the artifact this workflow exists to
+# produce: `dirtyfrag-<kmi>.ko`, which belong in `app/src/main/cpp/dfroot/ko/`.
+#
+# It is separate from `ksu-build.yml` on purpose. That workflow builds *their* module, patched into their
+# tree and versioned by that tree's tag; this one builds a standalone module out of `dfroot-lkm/`, and its
+# version is the source it was cut from rather than anything derived from a checkout.
+name: DFRoot LKM
+
+on:
+  workflow_dispatch:
+    inputs:
+      kmi:
+        description: 'JSON list of KMIs to build, or empty for all eight'
+        required: false
+        default: ''
+      ddk_release:
+        description: 'DDK image release'
+        required: false
+        default: '20260828'
+  push:
+    branches: [main]
+    paths:
+      - 'dfroot-lkm/**'
+      - '.github/workflows/dfroot-lkm.yml'
+
+permissions:
+  contents: read
+
+env:
+  KMI_SET: ${{ inputs.kmi || '["android12-5.10","android13-5.10","android13-5.15","android14-5.15","android14-6.1","android15-6.6","android16-6.12","android17-6.18"]' }}
+
+jobs:
+  lkm:
+    name: dfroot lkm (${{ matrix.kmi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Read from the input rather than through `env.KMI_SET`: a matrix is evaluated before the
+        # environment exists, so `env` is not a context a matrix can see.
+        kmi: ${{ fromJSON(inputs.kmi || '["android12-5.10","android13-5.10","android13-5.15","android14-5.15","android14-6.1","android15-6.6","android16-6.12","android17-6.18"]') }}
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-${{ inputs.ddk_release || '20260828' }}
+      options: --privileged
+    steps:
+      - name: Checkout payloads
+        uses: actions/checkout@v7
+
+      - name: Build the module
+        run: |
+          # `pipefail`, because the output is teed and the checks below read that file: a build that
+          # failed would otherwise be read as a build that printed nothing.
+          set -o pipefail
+          cd dfroot-lkm
+          make -j"$(nproc)" 2>&1 | tee /tmp/lkm-build.log
+          ls -l dirtyfrag.ko
+
+      - name: Size diet
+        run: |
+          # Not tidiness: the module is written through the exploit page by page, so its size is a page
+          # count. The strip keeps the load-relevant symbols and the `-R` removals drop sections the
+          # loader ignores; removing the empty .hyp.* sections repacks the file and reclaims the
+          # alignment padding.
+          cd dfroot-lkm
+          before=$(stat -c %s dirtyfrag.ko)
+          llvm-objcopy --strip-unneeded \
+            -R .comment -R .note.gnu.build-id -R .note.gnu.property -R .note.Linux -R .note.GNU-stack \
+            -R .BTF -R .BTF.base -R .llvm_addrsig \
+            -R .hyp.text -R .hyp.bss -R .hyp.rodata -R .hyp.event_ids \
+            -R .hyp.patchable_function_entries -R .hyp.data \
+            dirtyfrag.ko
+          after=$(stat -c %s dirtyfrag.ko)
+          echo "size: $before -> $after bytes"
+          modinfo ./dirtyfrag.ko | head -6
+
+      - name: The module still names this app's daemon, and not upstream's arguments
+        run: |
+          # These three facts live in strings, which is exactly what a merge resolves without a
+          # conflict - so a rebase onto a newer upstream would bring their path and their two flags
+          # back, build cleanly, and fail on a phone at the last step of a root.
+          cd dfroot-lkm
+          strings dirtyfrag.ko > /tmp/strings.txt
+          grep -q "dev.rushiranpise.rmgnext/ksud" /tmp/strings.txt || {
+            echo "::error::the module no longer names this app's staged daemon"
+            exit 1
+          }
+          if grep -q "df.root" /tmp/strings.txt; then
+            echo "::error::the module names upstream's package again"
+            exit 1
+          fi
+          for flag in -- --ro-partitions --soft-reboot; do
+            [ "$flag" = "--" ] && continue
+            if grep -q -- "$flag" /tmp/strings.txt; then
+              echo "::error::the module passes $flag, which the daemons built here do not accept"
+              exit 1
+            fi
+          done
+          echo "the module's daemon command is this project's"
+
+      - name: Name it for the KMI it was built for
+        run: |
+          cd dfroot-lkm
+          cp dirtyfrag.ko "dirtyfrag-${{ matrix.kmi }}.ko"
+          ls -l "dirtyfrag-${{ matrix.kmi }}.ko"
+
+      - name: Upload the module
+        uses: actions/upload-artifact@v7
+        with:
+          name: dfroot-lkm-${{ matrix.kmi }}
+          path: dfroot-lkm/dirtyfrag-${{ matrix.kmi }}.ko
+          if-no-files-found: error
