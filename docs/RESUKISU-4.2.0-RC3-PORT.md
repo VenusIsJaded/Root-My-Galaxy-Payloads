@@ -226,6 +226,35 @@ left trailing a new `-rc3`, and the rc2 → rc3 case is in its self-test. The en
 both places now. This is the second time a ReSukiSU release has taught the feed tooling about
 pre-releases; the first was `check_pair_version.py` learning that `4.2.0-rc2` is a version name at all.
 
+## Staging hardened after the rc3 rebase
+
+The `userspace/ksud` half of the delta carries three changes it did not have at the rebase, all about
+the one step in a late-load that cannot be undone by running it again - the rename of the staged daemon
+onto `/data/adb/ksud`:
+
+1. **The staged file is verified before it replaces anything.** `verify_daemon_elf` reads the first 64
+   bytes and requires a complete ELF64 little-endian AArch64 executable header - the same three facts
+   `tools/verify_pair.py` checks before a pair is published, made again at the moment of install against
+   the bytes that are actually about to become the daemon. A stage file that is truncated, empty or of
+   the wrong architecture would otherwise be renamed straight over a working daemon, and the failure
+   would only surface as the *next* run's `late-load` refusing to start - the least attributable place
+   it could. This is the mirror image of the validation this repository added to its publish path; the
+   publish check protects the feed, this one protects the device from whatever reached the stage file.
+2. **The rename falls back to a copy.** `rename(2)` is atomic and consumes the stage file, but it is
+   same-filesystem only; where it cannot work the bytes are copied and the stage file removed by hand,
+   so the caller sees the same consumed contract either way.
+3. **`stage_daemon` writes beside the destination and renames over it.** Its old `std::fs::write`
+   straight to `/data/adb/ksud` is exactly how a zero-byte daemon survives a full disk - the failure
+   this whole split exists to avoid - and a partial write there is overwritten silently on the next run
+   while everything else executes the broken one. The write now goes to `ksud.tmp` with an `fsync`
+   before the rename publishes it.
+
+All three are in `userspace/ksud/src/android/utils.rs`; the kernel half of the delta is untouched. The
+result was checked by applying the published patch to a clean `v4.2.0-rc3` checkout (`239e1e88`),
+regenerating the diff from that tree, and re-applying the regenerated patch to a second clean checkout
+with `git apply --check`. Nothing here is compiled or device-tested; the changes are Rust source only,
+and the published `ksud-rsksu-*` binaries predate them until a rebuild says otherwise.
+
 ## Deliberately not ported or changed
 
 - **Upstream's single-copy `install`.** Merging the two functions back together would undo the reason the
